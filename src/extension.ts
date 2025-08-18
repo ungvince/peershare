@@ -69,25 +69,27 @@ async function startSession() {
   bufferInterval = setInterval(() => {
     if (!ytext) return;
 
-    const deltas = [];
-
     doc!.transact(() => {
       while (contentChangesBuffer.length > 0) {
         const change = contentChangesBuffer.shift()!;
-  
+
         const offset = change.rangeOffset;
         const deletion = change.rangeLength;
         const insertion = change.text;
-        ytext.delete(offset, deletion);
-        ytext.insert(offset, insertion);
+        ytext!.delete(offset, deletion);
+        ytext!.insert(offset, insertion);
       }
-    })
+    });
   }, 100);
 
   ytext.observe(async (event, transaction) => {
     let cursor = 0;
 
-    if (event.transaction?.origin === "vscode-local" || event.transaction?.local) return;
+    if (
+      event.transaction?.origin === "vscode-local" ||
+      event.transaction?.local
+    )
+      return;
     syncing = true;
     const editor = vscode.window.activeTextEditor;
     if (!editor) return;
