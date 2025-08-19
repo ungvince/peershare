@@ -6,7 +6,7 @@ import { buffer } from "stream/consumers";
 let statusItem: vscode.StatusBarItem;
 let sessionActive = false;
 let participantCount = 0;
-let syncing = false;
+let uploading = false;
 
 let provider: WebsocketProvider | undefined;
 let doc: Y.Doc | undefined;
@@ -14,8 +14,26 @@ let ytext: Y.Text | undefined;
 
 let watcher: vscode.FileSystemWatcher | undefined;
 
+interface BaseRemoteChange {
+  offset: number;
+}
+
+interface RemoteInsert extends BaseRemoteChange {
+  type: "insert";
+  text: string;
+}
+
+interface RemoteDelete extends BaseRemoteChange {
+  type: "delete";
+  chars: number;
+}
+
+type RemoteChange = RemoteInsert | RemoteDelete;
+
 let contentChangesBuffer: vscode.TextDocumentContentChangeEvent[] = [];
-let bufferInterval: NodeJS.Timeout | undefined;
+const remoteChangeQueue: any[] = [];
+let isApplyingRemoteChange = false;
+const remoteChanges: RemoteChange[] = [];
 
 export function activate(context: vscode.ExtensionContext) {
   statusItem = vscode.window.createStatusBarItem(
@@ -38,22 +56,114 @@ export function activate(context: vscode.ExtensionContext) {
     }),
     vscode.commands.registerCommand("peershare.invite", async () => {
       const link = await createInviteLink();
-      await vscode.env.clipboard.writeText(link);
+      console.log(contentChangesBuffer);
+      await vscode.env.clipboard.writeText(ytext?.toJSON() as string);
       vscode.window.showInformationMessage("PeerShare invite link copied!");
     }),
     vscode.workspace.onDidChangeTextDocument(async (event) => {
-      if (syncing) return;
-
-      for (const change of event.contentChanges) {
-        contentChangesBuffer.push(change);
+      if (!sessionActive) {
+        return;
       }
 
-      vscode.workspace.fs.writeFile(
-        vscode.Uri.file("/home/vince/test/test.txt"),
-        new TextEncoder().encode(ytext!.toJSON())
+      const sortedChanges = [...event.contentChanges].sort(
+        (a, b) => b.rangeOffset - a.rangeOffset
       );
+
+      doc!.transact(() => {
+        let isRemoteChange = false;
+
+        for (const change of sortedChanges) {
+          if (isApplyingRemoteChange) {
+            let deletion: RemoteDelete = {
+              type: "delete",
+              offset: change.rangeOffset,
+              chars: change.rangeLength,
+            };
+
+            let insertion: RemoteInsert = {
+              type: "insert",
+              offset: change.rangeOffset,
+              text: change.text,
+            };
+            for (const remoteChange of remoteChanges) {
+              if (remoteChange.type === "delete") {
+                if (
+                  remoteChange.offset === deletion.offset &&
+                  remoteChange.chars === deletion.chars
+                ) {
+                  isRemoteChange = true;
+                  remoteChanges.splice(remoteChanges.indexOf(remoteChange), 1);
+                  break;
+                }
+              } else if (remoteChange.type === "insert") {
+                if (
+                  remoteChange.offset === insertion.offset &&
+                  remoteChange.text === insertion.text
+                ) {
+                  isRemoteChange = true;
+                  remoteChanges.splice(remoteChanges.indexOf(remoteChange), 1);
+                  break;
+                }
+              }
+            }
+          }
+          if (!isApplyingRemoteChange || !isRemoteChange)
+            ytext!.delete(change.rangeOffset, change.rangeLength);
+          if (!isApplyingRemoteChange || !isRemoteChange)
+            ytext!.insert(change.rangeOffset, change.text);
+        }
+      });
     })
   );
+}
+
+async function processRemoteChangeQueue() {
+  if (isApplyingRemoteChange || remoteChangeQueue.length === 0) {
+    return;
+  }
+
+  isApplyingRemoteChange = true;
+
+  const deltas = remoteChangeQueue.shift()!;
+  const editor = vscode.window.activeTextEditor;
+
+  if (!editor) return;
+
+  const workspaceEdit = new vscode.WorkspaceEdit();
+  let cursor = 0;
+
+  for (const delta of deltas) {
+    if (delta.retain) {
+      cursor += delta.retain;
+    }
+    if (delta.delete) {
+      const start = editor.document.positionAt(cursor);
+      const end = editor.document.positionAt(cursor + delta.delete);
+      remoteChanges.push({
+        type: "delete",
+        offset: cursor,
+        chars: delta.delete,
+      });
+      workspaceEdit.delete(editor.document.uri, new vscode.Range(start, end));
+    }
+    if (delta.insert && typeof delta.insert === "string") {
+      const pos = editor.document.positionAt(cursor);
+      remoteChanges.push({
+        type: "insert",
+        offset: cursor,
+        text: delta.insert,
+      });
+      workspaceEdit.insert(editor.document.uri, pos, delta.insert);
+    }
+  }
+
+  await vscode.workspace.applyEdit(workspaceEdit);
+
+  isApplyingRemoteChange = false;
+
+  if (remoteChangeQueue.length > 0) {
+    processRemoteChangeQueue();
+  }
 }
 
 async function startSession() {
@@ -66,45 +176,12 @@ async function startSession() {
 
   doc = new Y.Doc();
   ytext = doc.getText("shared-text");
-  bufferInterval = setInterval(() => {
-    if (!ytext) return;
-
-    doc!.transact(() => {
-      while (contentChangesBuffer.length > 0) {
-        const change = contentChangesBuffer.shift()!;
-
-        const offset = change.rangeOffset;
-        const deletion = change.rangeLength;
-        const insertion = change.text;
-        ytext!.delete(offset, deletion);
-        ytext!.insert(offset, insertion);
-      }
-    });
-  }, 100);
 
   ytext.observe(async (event, transaction) => {
-    let cursor = 0;
+    if (event.transaction?.local) return;
 
-    if (
-      event.transaction?.origin === "vscode-local" ||
-      event.transaction?.local
-    )
-      return;
-    syncing = true;
-    const editor = vscode.window.activeTextEditor;
-    if (!editor) return;
-
-    const firstLine = editor.document.lineAt(0);
-    const lastLine = editor.document.lineAt(editor.document.lineCount - 1);
-    const fullRange = new vscode.Range(
-      firstLine.range.start,
-      lastLine.range.end
-    );
-
-    await editor.edit((editBuilder) => {
-      editBuilder.replace(fullRange, event.target.toJSON());
-    });
-    syncing = false;
+    remoteChangeQueue.push(event.changes.delta);
+    processRemoteChangeQueue();
   });
 
   provider = new WebsocketProvider("ws://localhost:1234", room, doc);
@@ -163,7 +240,6 @@ async function stopSession() {
     "peershare.sessionActive",
     false
   );
-  bufferInterval && clearInterval(bufferInterval);
   provider?.destroy();
   doc?.destroy();
 
@@ -171,7 +247,6 @@ async function stopSession() {
   doc = undefined;
   ytext = undefined;
   participantCount = 0;
-  bufferInterval = undefined;
 
   updateStatusItem();
 }
