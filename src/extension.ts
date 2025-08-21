@@ -1,39 +1,29 @@
 import * as vscode from "vscode";
 import * as Y from "yjs";
 import { WebsocketProvider } from "y-websocket";
-import { buffer } from "stream/consumers";
+
+interface Change {
+  offset: number;
+  chars: number;
+  insert: string;
+}
+
+interface ChangeSet {
+  changes: Change[];
+  timestamp: Date;
+}
 
 let statusItem: vscode.StatusBarItem;
 let sessionActive = false;
-let participantCount = 0;
-let uploading = false;
+let participantCount = 1;
 
 let provider: WebsocketProvider | undefined;
 let doc: Y.Doc | undefined;
 let ytext: Y.Text | undefined;
 
-let watcher: vscode.FileSystemWatcher | undefined;
-
-interface BaseRemoteChange {
-  offset: number;
-}
-
-interface RemoteInsert extends BaseRemoteChange {
-  type: "insert";
-  text: string;
-}
-
-interface RemoteDelete extends BaseRemoteChange {
-  type: "delete";
-  chars: number;
-}
-
-type RemoteChange = RemoteInsert | RemoteDelete;
-
-let contentChangesBuffer: vscode.TextDocumentContentChangeEvent[] = [];
-const remoteChangeQueue: any[] = [];
-let isApplyingRemoteChange = false;
-const remoteChanges: RemoteChange[] = [];
+let processingRemoteChanges = false;
+const remoteChangeQueue: Change[][] = [];
+const expectedChangeSets: ChangeSet[] = [];
 
 export function activate(context: vscode.ExtensionContext) {
   statusItem = vscode.window.createStatusBarItem(
@@ -56,7 +46,6 @@ export function activate(context: vscode.ExtensionContext) {
     }),
     vscode.commands.registerCommand("peershare.invite", async () => {
       const link = await createInviteLink();
-      console.log(contentChangesBuffer);
       await vscode.env.clipboard.writeText(ytext?.toJSON() as string);
       vscode.window.showInformationMessage("PeerShare invite link copied!");
     }),
@@ -65,104 +54,82 @@ export function activate(context: vscode.ExtensionContext) {
         return;
       }
 
-      const sortedChanges = [...event.contentChanges].sort(
-        (a, b) => b.rangeOffset - a.rangeOffset
+      const changes: Change[] = event.contentChanges.map((change) => ({
+        offset: change.rangeOffset,
+        chars: change.rangeLength,
+        insert: change.text,
+      }));
+
+      const sortedChanges = [...changes].sort((a, b) => b.offset - a.offset);
+
+      const expectedChangeIndex = expectedChangeSets.findIndex(
+        (changeset) =>
+          JSON.stringify(sortedChanges) === JSON.stringify(changeset.changes)
       );
 
+      if (expectedChangeIndex !== -1) {
+        // console.log("\n");
+        // console.log(expectedChangeSets);
+        // console.log(expectedChangeSets[expectedChangeIndex]);
+        // console.log(sortedChanges);
+        expectedChangeSets.splice(expectedChangeIndex, 1);
+        return;
+      }
+
       doc!.transact(() => {
-        let isRemoteChange = false;
-
         for (const change of sortedChanges) {
-          if (isApplyingRemoteChange) {
-            let deletion: RemoteDelete = {
-              type: "delete",
-              offset: change.rangeOffset,
-              chars: change.rangeLength,
-            };
-
-            let insertion: RemoteInsert = {
-              type: "insert",
-              offset: change.rangeOffset,
-              text: change.text,
-            };
-            for (const remoteChange of remoteChanges) {
-              if (remoteChange.type === "delete") {
-                if (
-                  remoteChange.offset === deletion.offset &&
-                  remoteChange.chars === deletion.chars
-                ) {
-                  isRemoteChange = true;
-                  remoteChanges.splice(remoteChanges.indexOf(remoteChange), 1);
-                  break;
-                }
-              } else if (remoteChange.type === "insert") {
-                if (
-                  remoteChange.offset === insertion.offset &&
-                  remoteChange.text === insertion.text
-                ) {
-                  isRemoteChange = true;
-                  remoteChanges.splice(remoteChanges.indexOf(remoteChange), 1);
-                  break;
-                }
-              }
-            }
-          }
-          if (!isApplyingRemoteChange || !isRemoteChange)
-            ytext!.delete(change.rangeOffset, change.rangeLength);
-          if (!isApplyingRemoteChange || !isRemoteChange)
-            ytext!.insert(change.rangeOffset, change.text);
+          ytext!.delete(change.offset, change.chars);
+          ytext!.insert(change.offset, change.insert);
         }
       });
     })
   );
 }
 
-async function processRemoteChangeQueue() {
-  if (isApplyingRemoteChange || remoteChangeQueue.length === 0) {
-    return;
-  }
+function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
 
-  isApplyingRemoteChange = true;
-
-  const deltas = remoteChangeQueue.shift()!;
+async function processRemoteChanges() {
   const editor = vscode.window.activeTextEditor;
 
-  if (!editor) return;
+  if (processingRemoteChanges || !editor) return;
 
-  const workspaceEdit = new vscode.WorkspaceEdit();
-  let cursor = 0;
+  processingRemoteChanges = true;
 
-  for (const delta of deltas) {
-    if (delta.retain) {
-      cursor += delta.retain;
+  try {
+    while (remoteChangeQueue.length > 0) {
+      const changes = remoteChangeQueue.shift()!;
+
+      const workspaceEdit = new vscode.WorkspaceEdit();
+
+      for (const change of changes) {
+        const start = editor.document.positionAt(change.offset);
+        const end = editor.document.positionAt(change.offset + change.chars);
+        workspaceEdit.replace(
+          editor.document.uri,
+          new vscode.Range(start, end),
+          change.insert
+        );
+      }
+
+      expectedChangeSets.push({ changes, timestamp: new Date() });
+
+      let success = false;
+      let i = 0;
+
+      while (!success) {
+        success = await vscode.workspace.applyEdit(workspaceEdit);
+        if (!success) {
+          i += 1;
+          console.log("retry", i);
+        }
+      }
     }
-    if (delta.delete) {
-      const start = editor.document.positionAt(cursor);
-      const end = editor.document.positionAt(cursor + delta.delete);
-      remoteChanges.push({
-        type: "delete",
-        offset: cursor,
-        chars: delta.delete,
-      });
-      workspaceEdit.delete(editor.document.uri, new vscode.Range(start, end));
-    }
-    if (delta.insert && typeof delta.insert === "string") {
-      const pos = editor.document.positionAt(cursor);
-      remoteChanges.push({
-        type: "insert",
-        offset: cursor,
-        text: delta.insert,
-      });
-      workspaceEdit.insert(editor.document.uri, pos, delta.insert);
-    }
-  }
-
-  await vscode.workspace.applyEdit(workspaceEdit);
-
-  isApplyingRemoteChange = false;
-
-  if (remoteChangeQueue.length > 0) {
-    processRemoteChangeQueue();
+  } finally {
+    processingRemoteChanges = false;
   }
 }
 
@@ -177,11 +144,36 @@ async function startSession() {
   doc = new Y.Doc();
   ytext = doc.getText("shared-text");
 
-  ytext.observe(async (event, transaction) => {
+  ytext.observe(async (event) => {
     if (event.transaction?.local) return;
 
-    remoteChangeQueue.push(event.changes.delta);
-    processRemoteChangeQueue();
+    const changes: Change[] = [];
+
+    let index = 0;
+    for (const delta of event.changes.delta) {
+      if (delta.retain) {
+        changes.push({ offset: delta.retain + index, chars: 0, insert: "" });
+
+        index += delta.retain;
+      } else if (changes.length === 0) {
+        changes.push({ offset: 0, chars: 0, insert: "" });
+      }
+
+      if (delta.delete) {
+        changes[changes.length - 1].chars = delta.delete;
+
+        index += delta.delete;
+      }
+      if (delta.insert && typeof delta.insert === "string") {
+        changes[changes.length - 1].insert = delta.insert;
+      }
+    }
+
+    if (changes.length === 0) return;
+
+    remoteChangeQueue.push(changes);
+
+    processRemoteChanges();
   });
 
   provider = new WebsocketProvider("ws://localhost:1234", room, doc);
@@ -205,7 +197,6 @@ async function startSession() {
   });
 
   let awareness = provider.awareness;
-  participantCount = awareness.getStates().size;
 
   awareness.on(
     "change",
@@ -219,6 +210,25 @@ async function startSession() {
       removed: number[];
     }) => {
       console.log("Awareness changed:", { added, updated, removed });
+      participantCount += added.length - removed.length;
+
+      (async () => {
+        // await sleep(30000);
+        for (let i = 0; i < 100; i++) {
+          const workspaceEdit = new vscode.WorkspaceEdit();
+          workspaceEdit.insert(
+            vscode.window.activeTextEditor?.document.uri!,
+            vscode.window.activeTextEditor?.document.lineAt(0).range.end!,
+            "a"
+          );
+          let success = false;
+          while (!success) {
+            success = await vscode.workspace.applyEdit(workspaceEdit);
+          }
+          await sleep(250);
+        }
+      })();
+
       updateStatusItem();
     }
   );
@@ -246,7 +256,7 @@ async function stopSession() {
   provider = undefined;
   doc = undefined;
   ytext = undefined;
-  participantCount = 0;
+  participantCount = 1;
 
   updateStatusItem();
 }
